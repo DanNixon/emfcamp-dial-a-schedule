@@ -9,9 +9,11 @@ use axum::{
     routing::post,
     Json, Router,
 };
-use chrono::{Duration, Utc};
-use emfcamp_schedule_api::schedule::mutation::{
-    Mutators, SortedByStartTime, StartsAfter, StartsBefore,
+use chrono::{DateTime, Duration, FixedOffset, Utc};
+use emfcamp_schedule_api::schedule::{
+    event::Event,
+    mutation::{Mutators, SortedByStartTime, StartsAfter, StartsBefore},
+    Schedule,
 };
 use metrics::counter;
 use tracing::{error, info};
@@ -120,30 +122,27 @@ async fn call_menu_selection(Json(payload): Json<GatherResponse>) -> Response {
     Json(verbs).into_response()
 }
 
-const API_ERROR_MESSAGE: &str = "Oh no, something has gone very wrong. If this keeps happening, please feel free to shout at Dan until it is fixed. Be aware, Dan may shout back or indeed shout at others as appropriate.";
+const API_ERROR_MESSAGE: &str = "Oh no, something has gone very wrong. If this keeps happening, please feel free to shout at Dan until it is fixed. Be aware, Dan may shout back, or indeed shout at others as appropriate.";
 
 async fn query_and_respond_with_a_list_of_events(
     state: &AppState,
-    mutators: Mutators,
+    event_filter: impl Fn(Schedule) -> Vec<Event>,
     negative_response: &str,
     positive_response: &str,
+    event_to_text: impl Fn(&Event) -> Verb,
 ) -> Response {
     let verbs = match state.schedule_client.get_schedule().await {
-        Ok(mut schedule) => {
-            schedule.mutate(&mutators);
-            info!("Got {} events for query", schedule.events.len());
+        Ok(schedule) => {
+            let events = event_filter(schedule);
+            info!("Got {} events for query", events.len());
 
-            if schedule.events.is_empty() {
+            if events.is_empty() {
                 vec![crate::voice::speak_verb(negative_response)]
             } else {
                 let mut verbs = vec![crate::voice::speak_verb(positive_response)];
 
-                for event in schedule.events {
-                    // TODO
-                    verbs.push(crate::voice::speak_verb(&format!(
-                        "{} by {} at {}",
-                        event.title, event.speaker, event.venue
-                    )));
+                for event in events {
+                    verbs.push(event_to_text(&event));
                 }
 
                 verbs
@@ -164,15 +163,36 @@ async fn call_events_now(State(state): State<AppState>) -> Response {
     info!("Events now");
     counter!(crate::METRIC_REQUESTS_NAME, "endpoint" => "events_now").increment(1);
 
-    let mutators = Mutators::new(vec![
-        Box::<SortedByStartTime>::default(),
-        Box::new(EventsHappeningNow::new(Utc::now().into())),
-    ]);
+    let now = Utc::now().into();
 
     let negative = "There are no events in progress. Sad, I know. Or maybe it is a silly time and you should be asleep.";
     let positive = "The following events are in progress.";
 
-    query_and_respond_with_a_list_of_events(&state, mutators, negative, positive).await
+    query_and_respond_with_a_list_of_events(
+        &state,
+        |mut schedule| {
+            let mutators = Mutators::new(vec![
+                Box::<SortedByStartTime>::default(),
+                Box::new(EventsHappeningNow::new(now)),
+            ]);
+            schedule.mutate(&mutators);
+            schedule.events
+        },
+        negative,
+        positive,
+        |event| {
+            let title = &event.title;
+            let speaker = &event.speaker;
+            let venue = &event.venue;
+            let started = crate::voice::format_duration(now - event.start);
+            let ending = crate::voice::format_duration(event.end - now);
+
+            crate::voice::speak_verb(&format!(
+                "Started {started} ago and ending in {ending} in {venue}: {title} by {speaker}."
+            ))
+        },
+    )
+    .await
 }
 
 #[axum::debug_handler]
@@ -180,37 +200,89 @@ async fn call_events_starting_soon(State(state): State<AppState>) -> Response {
     info!("Events starting soon");
     counter!(crate::METRIC_REQUESTS_NAME, "endpoint" => "events_now_starting_soon").increment(1);
 
-    let now = Utc::now();
-
-    let range_start =
-        now + Duration::try_minutes(-2).expect("hardcoded value for duration should be correct");
-    let range_end =
-        now + Duration::try_minutes(10).expect("hardcoded value for duration should be correct");
-
-    let mutators = Mutators::new(vec![
-        Box::new(StartsAfter::new(range_start.into())),
-        Box::new(StartsBefore::new(range_end.into())),
-    ]);
+    let now: DateTime<FixedOffset> = Utc::now().into();
 
     let negative = "There are no events starting soon. Sad, I know. Or maybe it is a silly time and you should be asleep.";
     let positive = "The following events may be of interest.";
 
-    query_and_respond_with_a_list_of_events(&state, mutators, negative, positive).await
+    query_and_respond_with_a_list_of_events(
+        &state,
+        |mut schedule| {
+            let range_start = now
+                + Duration::try_minutes(-5)
+                    .expect("hardcoded value for duration should be correct");
+            let range_end = now
+                + Duration::try_minutes(15)
+                    .expect("hardcoded value for duration should be correct");
+
+            let mutators = Mutators::new(vec![
+                Box::new(StartsAfter::new(range_start)),
+                Box::new(StartsBefore::new(range_end)),
+            ]);
+
+            schedule.mutate(&mutators);
+            schedule.events
+        },
+        negative,
+        positive,
+        |event| {
+            let title = &event.title;
+            let speaker = &event.speaker;
+            let venue = &event.venue;
+
+            if event.start < now {
+                let started = crate::voice::format_duration(now - event.start);
+                crate::voice::speak_verb(&format!(
+                    "Started {started} ago in {venue}: {title} by {speaker}."
+                ))
+            } else {
+                let starting = crate::voice::format_duration(event.start - now);
+                crate::voice::speak_verb(&format!(
+                    "Starting in {starting} in {venue}: {title} by {speaker}."
+                ))
+            }
+        },
+    )
+    .await
 }
 
 #[axum::debug_handler]
-async fn call_next_events_everywhere(State(_state): State<AppState>) -> Response {
+async fn call_next_events_everywhere(State(state): State<AppState>) -> Response {
     info!("Next events at all venues");
     counter!(crate::METRIC_REQUESTS_NAME, "endpoint" => "events_now").increment(1);
 
-    // Events:
-    //     - next events for every venue
-    // Or sad message if all events have ended
+    let now = Utc::now().into();
 
-    // TODO
-    let verbs = vec![crate::voice::speak_verb("Implement me please.")];
+    let negative = "There are no more events in the schedule. EMF 2024 is over. Everyone is sad, everyone apart from the spiders, and maybe the ducks.";
+    let positive = "Here are the next events.";
 
-    Json(verbs).into_response()
+    query_and_respond_with_a_list_of_events(
+        &state,
+        |schedule| {
+            let epg = schedule.now_and_next(now);
+
+            let mut events: Vec<Event> = epg.guide.values().fold(Vec::new(), |mut acc, x| {
+                let mut next = x.next.clone();
+                acc.append(&mut next);
+                acc
+            });
+
+            // Ensure events are sorted by start time
+            events.sort();
+
+            events
+        },
+        negative,
+        positive,
+        |event| {
+            let title = &event.title;
+            let venue = &event.venue;
+            let start = crate::voice::format_timestamp_relative_to(event.start, now);
+
+            crate::voice::speak_verb(&format!("Starting {start} at {venue}: {title}."))
+        },
+    )
+    .await
 }
 
 #[axum::debug_handler]
@@ -218,23 +290,41 @@ async fn call_upcoming_talks_summary(State(state): State<AppState>) -> Response 
     info!("Upcoming talks summary");
     counter!(crate::METRIC_REQUESTS_NAME, "endpoint" => "upcoming_talks_summary").increment(1);
 
-    let now = Utc::now();
+    let now = Utc::now().into();
 
     let hours = 3;
-    let until =
-        now + Duration::try_hours(hours).expect("hardcoded value for duration should be correct");
-
-    let mutators = Mutators::new(vec![
-        Box::new(StartsAfter::new(now.into())),
-        Box::new(StartsBefore::new(until.into())),
-        Box::<EventIsTalk>::default(),
-    ]);
 
     let negative = format!("There are no talks starting in the next {hours} hours. Maybe it is late and you should have a beer and enjoy some music. Sadly I can't join you, I am stuck in the telephone.");
     let positive =
         format!("Here are the talks you can look forward to over the next {hours} hours.");
 
-    query_and_respond_with_a_list_of_events(&state, mutators, &negative, &positive).await
+    query_and_respond_with_a_list_of_events(
+        &state,
+        |mut schedule| {
+            let until = now
+                + Duration::try_hours(hours)
+                    .expect("hardcoded value for duration should be correct");
+
+            let mutators = Mutators::new(vec![
+                Box::new(StartsAfter::new(now)),
+                Box::new(StartsBefore::new(until)),
+                Box::<EventIsTalk>::default(),
+            ]);
+
+            schedule.mutate(&mutators);
+            schedule.events
+        },
+        &negative,
+        &positive,
+        |event| {
+            let title = &event.title;
+            let venue = &event.venue;
+            let start = crate::voice::format_timestamp_relative_to(event.start, now);
+
+            crate::voice::speak_verb(&format!("Starting {start} at {venue}: {title}."))
+        },
+    )
+    .await
 }
 
 #[axum::debug_handler]
@@ -242,22 +332,40 @@ async fn call_upcoming_workshops_summary(State(state): State<AppState>) -> Respo
     info!("Upcoming workshops summary");
     counter!(crate::METRIC_REQUESTS_NAME, "endpoint" => "upcoming_workshops_summary").increment(1);
 
-    let now = Utc::now();
+    let now = Utc::now().into();
 
     let hours = 3;
-    let until =
-        now + Duration::try_hours(hours).expect("hardcoded value for duration should be correct");
-
-    let mutators = Mutators::new(vec![
-        Box::new(StartsAfter::new(now.into())),
-        Box::new(StartsBefore::new(until.into())),
-        Box::<EventIsWorkshop>::default(),
-    ]);
 
     let negative = format!("There are no workshops starting in the next {hours} hours. Maybe it is late and you should have a beer and enjoy some music. Sadly I can't join you, I am stuck in the telephone.");
     let positive = format!("Here are the workshops you can look forward to over the next {hours} hours. Well, assuming you won the appropriate ticket lottery.");
 
-    query_and_respond_with_a_list_of_events(&state, mutators, &negative, &positive).await
+    query_and_respond_with_a_list_of_events(
+        &state,
+        |mut schedule| {
+            let until = now
+                + Duration::try_hours(hours)
+                    .expect("hardcoded value for duration should be correct");
+
+            let mutators = Mutators::new(vec![
+                Box::new(StartsAfter::new(now)),
+                Box::new(StartsBefore::new(until)),
+                Box::<EventIsWorkshop>::default(),
+            ]);
+
+            schedule.mutate(&mutators);
+            schedule.events
+        },
+        &negative,
+        &positive,
+        |event| {
+            let title = &event.title;
+            let venue = &event.venue;
+            let start = crate::voice::format_timestamp_relative_to(event.start, now);
+
+            crate::voice::speak_verb(&format!("Starting {start} at {venue}: {title}."))
+        },
+    )
+    .await
 }
 
 #[axum::debug_handler]
@@ -266,20 +374,38 @@ async fn call_upcoming_performances_summary(State(state): State<AppState>) -> Re
     counter!(crate::METRIC_REQUESTS_NAME, "endpoint" => "upcoming_performances_summary")
         .increment(1);
 
-    let now = Utc::now();
+    let now = Utc::now().into();
 
     let hours = 3;
-    let until =
-        now + Duration::try_hours(hours).expect("hardcoded value for duration should be correct");
-
-    let mutators = Mutators::new(vec![
-        Box::new(StartsAfter::new(now.into())),
-        Box::new(StartsBefore::new(until.into())),
-        Box::<EventIsPerformance>::default(),
-    ]);
 
     let negative = format!("There are no performances starting in the next {hours} hours. Maybe you could find an interesting talk to pass the time?");
     let positive = format!("Here are the performances taking place over the next {hours} hours.");
 
-    query_and_respond_with_a_list_of_events(&state, mutators, &negative, &positive).await
+    query_and_respond_with_a_list_of_events(
+        &state,
+        |mut schedule| {
+            let until = now
+                + Duration::try_hours(hours)
+                    .expect("hardcoded value for duration should be correct");
+
+            let mutators = Mutators::new(vec![
+                Box::new(StartsAfter::new(now)),
+                Box::new(StartsBefore::new(until)),
+                Box::<EventIsPerformance>::default(),
+            ]);
+
+            schedule.mutate(&mutators);
+            schedule.events
+        },
+        &negative,
+        &positive,
+        |event| {
+            let title = &event.title;
+            let venue = &event.venue;
+            let start = crate::voice::format_timestamp_relative_to(event.start, now);
+
+            crate::voice::speak_verb(&format!("Starting {start} at {venue}: {title}."))
+        },
+    )
+    .await
 }
