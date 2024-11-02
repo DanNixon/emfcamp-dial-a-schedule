@@ -20,15 +20,9 @@
           rustc = pkgs.rustc;
         };
 
-        nativeBuildInputs = with pkgs; [];
-        buildInputs = with pkgs; [];
-
         lintingRustFlags = "-D unused-crate-dependencies";
-      in rec {
+      in {
         devShell = pkgs.mkShell {
-          nativeBuildInputs = nativeBuildInputs;
-          buildInputs = buildInputs;
-
           packages = with pkgs; [
             # Rust toolchain
             cargo
@@ -51,7 +45,7 @@
             skopeo
           ];
 
-          # RUSTFLAGS = lintingRustFlags;
+          RUSTFLAGS = lintingRustFlags;
         };
 
         packages = rec {
