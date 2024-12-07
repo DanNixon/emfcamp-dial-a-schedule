@@ -2,9 +2,10 @@ use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "snake_case", tag = "verb")]
+#[allow(dead_code)]
 pub(crate) enum Verb {
     Redirect(Redirect),
-    // Pause(Pause),
+    Pause(Pause),
     Say(Say),
     Gather(Gather),
 }
